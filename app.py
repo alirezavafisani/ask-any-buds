@@ -92,16 +92,39 @@ def get_channel_videos(channel_handle, limit=50):
 def get_transcript_with_timestamps(video_id):
     try:
         ytt_api = YouTubeTranscriptApi()
-        transcript_list = ytt_api.fetch(video_id)
+        
+        # Try to get available transcripts first
+        transcript_list = ytt_api.list(video_id)
+        
+        # Try to find English transcript (manual or auto-generated)
+        transcript = None
+        try:
+            transcript = transcript_list.find_transcript(['en'])
+        except:
+            try:
+                transcript = transcript_list.find_generated_transcript(['en'])
+            except:
+                # Get whatever is available
+                try:
+                    transcript = transcript_list.find_transcript(['en-US', 'en-GB'])
+                except:
+                    available = list(transcript_list)
+                    if available:
+                        transcript = available[0]
+        
+        if transcript is None:
+            return None
+        
+        fetched = transcript.fetch()
         processed = []
-        for item in transcript_list:
+        for item in fetched:
             processed.append({
                 "text": item.text,
                 "start": item.start,
                 "end": item.start + item.duration
             })
         return processed
-    except:
+    except Exception as e:
         return None
 
 
