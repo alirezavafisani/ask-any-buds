@@ -36,7 +36,7 @@ def process_video_and_ask(url, query):
         # A. LOAD DATA
         with st.status("Processing video...", expanded=True) as status:
             st.write("1. Extracting transcript from YouTube...")
-            loader = YoutubeLoader.from_youtube_url(url, add_video_info=True)
+            loader = YoutubeLoader.from_youtube_url(url, add_video_info=False)
             documents = loader.load()
             
             # B. SPLIT TEXT
