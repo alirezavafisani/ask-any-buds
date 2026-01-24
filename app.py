@@ -258,7 +258,7 @@ def get_channel_videos(channel_handle, limit=50):
     return videos
 
 
-def get_transcript_with_timestamps(video_id):
+def get_transcript_with_timestamps(video_id, status=None):
     try:
         ytt_api = YouTubeTranscriptApi()
         transcript_list = ytt_api.fetch(video_id)
@@ -271,6 +271,8 @@ def get_transcript_with_timestamps(video_id):
             })
         return processed
     except Exception as e:
+        if status:
+            status.write(f"   ✗ {video_id}: {str(e)[:80]}")
         return None
 
 
@@ -398,7 +400,7 @@ if st.button("🎙️ Search Channel"):
         progress_bar = st.progress(0)
         
         for i, video in enumerate(top_videos):
-            transcript = get_transcript_with_timestamps(video["id"])
+            transcript = get_transcript_with_timestamps(video["id"], status)
             if transcript:
                 docs = create_documents_with_timestamps(
                     transcript, 
@@ -420,7 +422,7 @@ if st.button("🎙️ Search Channel"):
             remaining = [v for v in videos if v["id"] not in [tv["id"] for tv in top_videos]]
             
             for i, video in enumerate(remaining[:20]):
-                transcript = get_transcript_with_timestamps(video["id"])
+                transcript = get_transcript_with_timestamps(video["id"], status)
                 if transcript:
                     docs = create_documents_with_timestamps(
                         transcript, 
