@@ -270,7 +270,7 @@ def get_transcript_with_timestamps(video_id):
                 "end": item.start + item.duration
             })
         return processed
-    except:
+    except Exception as e:
         return None
 
 
@@ -393,6 +393,7 @@ if st.button("🎙️ Search Channel"):
         status.write("📝 Fetching transcripts from relevant videos...")
         all_documents = []
         success_count = 0
+        failed_videos = []
         
         progress_bar = st.progress(0)
         
@@ -406,9 +407,32 @@ if st.button("🎙️ Search Channel"):
                 )
                 all_documents.extend(docs)
                 success_count += 1
+                status.write(f"   ✓ {video['title'][:50]}")
+            else:
+                failed_videos.append(video["id"])
             progress_bar.progress((i + 1) / len(top_videos))
         
         progress_bar.empty()
+        
+        # Fallback: if no transcripts from ranked videos, try remaining videos
+        if success_count == 0:
+            status.write("⚠️ Ranked videos had no captions. Trying other videos...")
+            remaining = [v for v in videos if v["id"] not in [tv["id"] for tv in top_videos]]
+            
+            for i, video in enumerate(remaining[:20]):
+                transcript = get_transcript_with_timestamps(video["id"])
+                if transcript:
+                    docs = create_documents_with_timestamps(
+                        transcript, 
+                        video["id"], 
+                        video["title"]
+                    )
+                    all_documents.extend(docs)
+                    success_count += 1
+                    status.write(f"   ✓ {video['title'][:50]}")
+                    if success_count >= 10:
+                        break
+        
         status.write(f"   Processed {success_count} videos, {len(all_documents)} chunks")
         
         if not all_documents:
