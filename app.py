@@ -6,8 +6,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
-import yt_dlp
-from pydub import AudioSegment
 
 # ============================================
 # PAGE CONFIG
@@ -86,7 +84,6 @@ def get_transcript_with_timestamps(video_id):
     return processed
 
 
-
 def create_documents_with_timestamps(transcript_segments, chunk_size=500):
     documents = []
     current_text = ""
@@ -133,40 +130,6 @@ def semantic_search(documents, query, api_key, top_k=3):
     return processed_results
 
 
-def download_audio(video_url, output_path):
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': output_path,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
-    
-    return output_path + ".mp3"
-
-
-def cut_and_concatenate_audio(audio_path, segments, output_path):
-    full_audio = AudioSegment.from_mp3(audio_path)
-    combined = AudioSegment.empty()
-    
-    for start, end in segments:
-        start_ms = max(0, int(start * 1000) - 300)
-        end_ms = min(len(full_audio), int(end * 1000) + 300)
-        clip = full_audio[start_ms:end_ms]
-        clip = clip.fade_in(100).fade_out(100)
-        combined += clip + AudioSegment.silent(duration=200)
-    
-    combined.export(output_path, format="mp3")
-    return output_path
-
-
 # ============================================
 # MAIN UI
 # ============================================
@@ -200,34 +163,22 @@ if st.button("🎙️ Generate Answer"):
         avg_score = sum(score for _, score in results) / len(results)
         status.write(f"   Relevance: {avg_score:.1f}%")
         
-        status.write("⬇️ Downloading audio...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            audio_base = os.path.join(tmpdir, "audio")
-            audio_path = download_audio(who, audio_base)
-            status.write("   Download complete")
-            
-            segments = [(doc.metadata["start"], doc.metadata["end"]) for doc, _ in results]
-            segments.sort(key=lambda x: x[0])
-            
-            status.write("✂️ Cutting and joining clips...")
-            output_path = os.path.join(tmpdir, "answer.mp3")
-            cut_and_concatenate_audio(audio_path, segments, output_path)
-            
-            with open(output_path, "rb") as f:
-                audio_bytes = f.read()
-        
         status.update(label="✅ Done!", state="complete", expanded=False)
         
         st.markdown("---")
         st.markdown("### 🎧 Their Answer")
-        st.audio(audio_bytes, format="audio/mp3")
+        
+        segments = [(doc.metadata["start"], doc.metadata["end"]) for doc, _ in results]
+        segments.sort(key=lambda x: x[0])
         
         st.markdown(f"**Relevance Score:** {avg_score:.1f}%")
         
-        with st.expander("📜 Transcript"):
-            for doc, score in results:
+        for i, (doc, score) in enumerate(results, 1):
+            start_sec = int(doc.metadata['start'])
+            st.markdown(f"**Clip {i}** (starts at {start_sec}s)")
+            st.video(who, start_time=start_sec)
+            with st.expander(f"Transcript for clip {i}"):
                 st.write(doc.page_content)
-                st.caption(f"Timestamp: {doc.metadata['start']:.1f}s to {doc.metadata['end']:.1f}s")
     
     except Exception as e:
         status.update(label="❌ Error", state="error")
@@ -235,4 +186,4 @@ if st.button("🎙️ Generate Answer"):
         st.info("Make sure the video has captions enabled.")
 
 st.markdown("---")
-st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>RAG + Audio Processing Pipeline</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>RAG + Semantic Search + Timestamp Extraction</p>", unsafe_allow_html=True)
