@@ -5,7 +5,7 @@ import tempfile
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 import yt_dlp
 from pydub import AudioSegment
 
