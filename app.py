@@ -4,6 +4,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 import scrapetube
+import time
+import random
 
 # ============================================
 # PAGE CONFIG
@@ -77,7 +79,7 @@ def get_channel_videos(channel_handle, limit=50):
                 "id": video["videoId"],
                 "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
             })
-    except:
+    except Exception:
         try:
             for video in scrapetube.get_channel(channel_url=f"https://www.youtube.com/@{channel_handle}", limit=limit):
                 videos.append({
@@ -90,19 +92,29 @@ def get_channel_videos(channel_handle, limit=50):
 
 
 def get_transcript_with_timestamps(video_id):
-    from youtube_transcript_api import YouTubeTranscriptApi
+    """Fetch transcript with error handling for rate limits and missing captions."""
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        transcript = ytt_api.fetch(video_id)
+        
+        processed = []
+        for item in transcript:
+            processed.append({
+                "text": item.text,
+                "start": item.start,
+                "end": item.start + item.duration
+            })
+        return processed
     
-    ytt_api = YouTubeTranscriptApi()
-    transcript = ytt_api.fetch(video_id)
-    
-    processed = []
-    for item in transcript:
-        processed.append({
-            "text": item.text,
-            "start": item.start,
-            "end": item.start + item.duration
-        })
-    return processed
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # Check if it's an IP block issue
+        if "ip" in error_msg or "blocked" in error_msg or "too many" in error_msg:
+            raise Exception("YouTube is blocking requests. Try again later or use fewer videos.")
+        
+        # For other errors (no captions, etc), return None silently
+        return None
 
 
 def create_documents_with_timestamps(transcript_segments, video_id, video_title, chunk_size=500):
@@ -157,7 +169,9 @@ def semantic_search(documents, query, api_key, top_k=5):
     
     processed_results = []
     for doc, distance in results:
-        similarity = max(0, min(100, (1 - distance / 2) * 100))
+        # FAISS L2 distance to similarity percentage
+        # Lower distance means more similar
+        similarity = max(0, min(100, (1 / (1 + distance)) * 100))
         processed_results.append((doc, similarity))
     
     return processed_results
@@ -194,27 +208,44 @@ if st.button("Search Channel"):
         
         status.write(f"Found {len(videos)} videos")
         
-        status.write("Fetching transcripts (this may take a minute)...")
+        status.write("Fetching transcripts (this may take a few minutes due to rate limiting)...")
         all_documents = []
         success_count = 0
+        failed_count = 0
         
         progress_bar = st.progress(0)
         
         for i, video in enumerate(videos):
-            transcript = get_transcript_with_timestamps(video["id"])
-            if transcript:
-                docs = create_documents_with_timestamps(
-                    transcript, 
-                    video["id"], 
-                    video["title"]
-                )
-                all_documents.extend(docs)
-                success_count += 1
-            
-            progress_bar.progress((i + 1) / len(videos))
+            try:
+                transcript = get_transcript_with_timestamps(video["id"])
+                if transcript:
+                    docs = create_documents_with_timestamps(
+                        transcript, 
+                        video["id"], 
+                        video["title"]
+                    )
+                    all_documents.extend(docs)
+                    success_count += 1
+                else:
+                    failed_count += 1
+                
+                progress_bar.progress((i + 1) / len(videos))
+                
+                # Add delay between requests to avoid rate limiting
+                # Randomize between 1.5 and 3.5 seconds
+                if i < len(videos) - 1:
+                    time.sleep(random.uniform(1.5, 3.5))
+                    
+            except Exception as e:
+                error_msg = str(e)
+                if "blocking" in error_msg.lower():
+                    status.update(label="Rate Limited", state="error")
+                    st.error(f"YouTube blocked requests after {success_count} videos. Try again later with fewer videos.")
+                    st.stop()
+                failed_count += 1
         
         progress_bar.empty()
-        status.write(f"Processed {success_count} videos with captions")
+        status.write(f"Processed {success_count} videos with captions ({failed_count} skipped)")
         status.write(f"Created {len(all_documents)} searchable chunks")
         
         if not all_documents:
