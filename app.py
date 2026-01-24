@@ -1,18 +1,18 @@
 import streamlit as st
+import os
+import tempfile
+
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
-import scrapetube
-import time
-import random
 
 # ============================================
 # PAGE CONFIG
 # ============================================
 st.set_page_config(
     page_title="AskAnyBuds",
-    page_icon="A",
+    page_icon="🎙️",
     layout="centered"
 )
 
@@ -46,7 +46,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown("# AskAnyBuds")
-st.markdown("<p style='text-align:center;color:#666;'>Ask any YouTuber anything. Search their entire channel.</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#666;'>Hear answers in their own voice</p>", unsafe_allow_html=True)
 st.markdown("---")
 
 # ============================================
@@ -61,63 +61,30 @@ if not api_key:
 # HELPER FUNCTIONS
 # ============================================
 
-def extract_channel_id(url):
-    if "/@" in url:
-        return url.split("/@")[1].split("/")[0].split("?")[0]
-    elif "/channel/" in url:
-        return url.split("/channel/")[1].split("/")[0].split("?")[0]
-    elif "/c/" in url:
-        return url.split("/c/")[1].split("/")[0].split("?")[0]
-    return url.strip()
-
-
-def get_channel_videos(channel_handle, limit=50):
-    videos = []
-    try:
-        for video in scrapetube.get_channel(channel_username=channel_handle, limit=limit):
-            videos.append({
-                "id": video["videoId"],
-                "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
-            })
-    except Exception:
-        try:
-            for video in scrapetube.get_channel(channel_url=f"https://www.youtube.com/@{channel_handle}", limit=limit):
-                videos.append({
-                    "id": video["videoId"],
-                    "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
-                })
-        except Exception as e:
-            st.error(f"Could not fetch channel: {e}")
-    return videos
+def extract_video_id(url):
+    if "v=" in url:
+        return url.split("v=")[1].split("&")[0]
+    elif "youtu.be/" in url:
+        return url.split("youtu.be/")[1].split("?")[0]
+    elif "shorts/" in url:
+        return url.split("shorts/")[1].split("?")[0]
+    return None
 
 
 def get_transcript_with_timestamps(video_id):
-    """Fetch transcript with error handling for rate limits and missing captions."""
-    try:
-        ytt_api = YouTubeTranscriptApi()
-        transcript = ytt_api.fetch(video_id)
-        
-        processed = []
-        for item in transcript:
-            processed.append({
-                "text": item.text,
-                "start": item.start,
-                "end": item.start + item.duration
-            })
-        return processed
-    
-    except Exception as e:
-        error_msg = str(e).lower()
-        
-        # Check if it's an IP block issue
-        if "ip" in error_msg or "blocked" in error_msg or "too many" in error_msg:
-            raise Exception("YouTube is blocking requests. Try again later or use fewer videos.")
-        
-        # For other errors (no captions, etc), return None silently
-        return None
+    ytt_api = YouTubeTranscriptApi()
+    transcript_list = ytt_api.fetch(video_id)
+    processed = []
+    for item in transcript_list:
+        processed.append({
+            "text": item.text,
+            "start": item.start,
+            "end": item.start + item.duration
+        })
+    return processed
 
 
-def create_documents_with_timestamps(transcript_segments, video_id, video_title, chunk_size=500):
+def create_documents_with_timestamps(transcript_segments, chunk_size=500):
     documents = []
     current_text = ""
     current_start = None
@@ -133,13 +100,7 @@ def create_documents_with_timestamps(transcript_segments, video_id, video_title,
         if len(current_text) >= chunk_size:
             doc = Document(
                 page_content=current_text.strip(),
-                metadata={
-                    "start": current_start,
-                    "end": current_end,
-                    "video_id": video_id,
-                    "video_title": video_title,
-                    "url": f"https://www.youtube.com/watch?v={video_id}"
-                }
+                metadata={"start": current_start, "end": current_end}
             )
             documents.append(doc)
             current_text = ""
@@ -149,29 +110,21 @@ def create_documents_with_timestamps(transcript_segments, video_id, video_title,
     if current_text.strip():
         doc = Document(
             page_content=current_text.strip(),
-            metadata={
-                "start": current_start,
-                "end": current_end,
-                "video_id": video_id,
-                "video_title": video_title,
-                "url": f"https://www.youtube.com/watch?v={video_id}"
-            }
+            metadata={"start": current_start, "end": current_end}
         )
         documents.append(doc)
     
     return documents
 
 
-def semantic_search(documents, query, api_key, top_k=5):
+def semantic_search(documents, query, api_key, top_k=3):
     embeddings = OpenAIEmbeddings(openai_api_key=api_key)
     vector_store = FAISS.from_documents(documents, embeddings)
     results = vector_store.similarity_search_with_score(query, k=top_k)
     
     processed_results = []
     for doc, distance in results:
-        # FAISS L2 distance to similarity percentage
-        # Lower distance means more similar
-        similarity = max(0, min(100, (1 / (1 + distance)) * 100))
+        similarity = max(0, min(100, (1 - distance / 2) * 100))
         processed_results.append((doc, similarity))
     
     return processed_results
@@ -181,106 +134,56 @@ def semantic_search(documents, query, api_key, top_k=5):
 # MAIN UI
 # ============================================
 
-who = st.text_input("Who to ask?", placeholder="YouTube channel URL (e.g. https://www.youtube.com/@IAmMarkManson)")
+who = st.text_input("Who to ask?", placeholder="Paste YouTube URL here")
 what = st.text_input("What to ask?", placeholder="Your question")
-video_limit = st.slider("How many videos to search?", min_value=10, max_value=100, value=30)
 
-if st.button("Search Channel"):
+if st.button("🎙️ Generate Answer"):
     if not who or not what:
         st.warning("Please fill in both fields.")
         st.stop()
     
-    channel_handle = extract_channel_id(who)
-    if not channel_handle:
-        st.error("Invalid channel URL.")
+    video_id = extract_video_id(who)
+    if not video_id:
+        st.error("Invalid YouTube URL.")
         st.stop()
     
-    status = st.status("Processing channel...", expanded=True)
+    status = st.status("Processing...", expanded=True)
     
     try:
-        status.write(f"Fetching videos from @{channel_handle}...")
-        videos = get_channel_videos(channel_handle, limit=video_limit)
+        status.write("📝 Fetching transcript...")
+        transcript = get_transcript_with_timestamps(video_id)
+        status.write(f"   Found {len(transcript)} segments")
         
-        if not videos:
-            status.update(label="Error", state="error")
-            st.error("Could not find any videos. Check the channel URL.")
-            st.stop()
+        status.write("📦 Creating chunks...")
+        documents = create_documents_with_timestamps(transcript)
+        status.write(f"   Created {len(documents)} chunks")
         
-        status.write(f"Found {len(videos)} videos")
-        
-        status.write("Fetching transcripts (this may take a few minutes due to rate limiting)...")
-        all_documents = []
-        success_count = 0
-        failed_count = 0
-        
-        progress_bar = st.progress(0)
-        
-        for i, video in enumerate(videos):
-            try:
-                transcript = get_transcript_with_timestamps(video["id"])
-                if transcript:
-                    docs = create_documents_with_timestamps(
-                        transcript, 
-                        video["id"], 
-                        video["title"]
-                    )
-                    all_documents.extend(docs)
-                    success_count += 1
-                else:
-                    failed_count += 1
-                
-                progress_bar.progress((i + 1) / len(videos))
-                
-                # Add delay between requests to avoid rate limiting
-                # Randomize between 1.5 and 3.5 seconds
-                if i < len(videos) - 1:
-                    time.sleep(random.uniform(1.5, 3.5))
-                    
-            except Exception as e:
-                error_msg = str(e)
-                if "blocking" in error_msg.lower():
-                    status.update(label="Rate Limited", state="error")
-                    st.error(f"YouTube blocked requests after {success_count} videos. Try again later with fewer videos.")
-                    st.stop()
-                failed_count += 1
-        
-        progress_bar.empty()
-        status.write(f"Processed {success_count} videos with captions ({failed_count} skipped)")
-        status.write(f"Created {len(all_documents)} searchable chunks")
-        
-        if not all_documents:
-            status.update(label="Error", state="error")
-            st.error("No transcripts found. The channel may not have captions enabled.")
-            st.stop()
-        
-        status.write("Searching for relevant segments...")
-        results = semantic_search(all_documents, what, api_key, top_k=5)
+        status.write("🔍 Searching for relevant segments...")
+        results = semantic_search(documents, what, api_key, top_k=3)
         avg_score = sum(score for _, score in results) / len(results)
-        status.write(f"Relevance: {avg_score:.1f}%")
+        status.write(f"   Relevance: {avg_score:.1f}%")
         
-        status.update(label="Done!", state="complete", expanded=False)
+        status.update(label="✅ Done!", state="complete", expanded=False)
         
         st.markdown("---")
-        st.markdown("### Their Answer")
+        st.markdown("### 🎧 Their Answer")
+        
+        segments = [(doc.metadata["start"], doc.metadata["end"]) for doc, _ in results]
+        segments.sort(key=lambda x: x[0])
+        
         st.markdown(f"**Relevance Score:** {avg_score:.1f}%")
-        st.markdown(f"*Searched {success_count} videos, {len(all_documents)} chunks*")
         
         for i, (doc, score) in enumerate(results, 1):
             start_sec = int(doc.metadata['start'])
-            video_url = doc.metadata['url']
-            video_title = doc.metadata['video_title']
-            
-            st.markdown(f"---")
-            st.markdown(f"**Clip {i}** from: *{video_title}*")
-            st.markdown(f"Relevance: {score:.1f}% | Starts at {start_sec}s")
-            st.video(video_url, start_time=start_sec)
-            
-            with st.expander(f"View transcript"):
+            st.markdown(f"**Clip {i}** (starts at {start_sec}s)")
+            st.video(who, start_time=start_sec)
+            with st.expander(f"Transcript for clip {i}"):
                 st.write(doc.page_content)
     
     except Exception as e:
-        status.update(label="Error", state="error")
+        status.update(label="❌ Error", state="error")
         st.error(f"Error: {str(e)}")
+        st.info("Make sure the video has captions enabled.")
 
 st.markdown("---")
-st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>RAG + Semantic Search Across Entire Channels</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>RAG + Semantic Search + Timestamp Extraction</p>", unsafe_allow_html=True)

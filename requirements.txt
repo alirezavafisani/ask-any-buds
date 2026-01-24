@@ -7,4 +7,3 @@ langchain-openai>=0.0.5
 faiss-cpu>=1.7.4
 openai>=1.0.0
 numpy>=1.24.0
-scrapetube>=2.5.0
