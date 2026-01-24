@@ -72,99 +72,37 @@ def extract_channel_id(url):
 def get_channel_videos(channel_handle, limit=50):
     videos = []
     try:
-        status.write(f"Fetching videos from @{channel_handle}...")
-        videos = get_channel_videos(channel_handle, limit=video_limit)
-        
-        if not videos:
-            status.update(label="Error", state="error")
-            st.error("Could not find any videos. Check the channel URL.")
-            st.stop()
-        
-        status.write(f"Found {len(videos)} videos")
-        
-        # DEBUG: Show first 3 video IDs
-        for v in videos[:3]:
-            status.write(f"   Video: {v['id']} - {v['title'][:30]}")
-        
-        status.write("Fetching transcripts (this may take a minute)...")
-        all_documents = []
-        success_count = 0
-        errors = []
-        
-        progress_bar = st.progress(0)
-        
-        for i, video in enumerate(videos):
-            try:
-                ytt_api = YouTubeTranscriptApi()
-                transcript_list = ytt_api.list(video["id"])
-                available = list(transcript_list)
-                
-                if available:
-                    fetched = available[0].fetch()
-                    processed = []
-                    for item in fetched:
-                        processed.append({
-                            "text": item.text,
-                            "start": item.start,
-                            "end": item.start + item.duration
-                        })
-                    
-                    if processed:
-                        docs = create_documents_with_timestamps(
-                            processed, 
-                            video["id"], 
-                            video["title"]
-                        )
-                        all_documents.extend(docs)
-                        success_count += 1
-            except Exception as e:
-                errors.append(f"{video['id']}: {str(e)[:50]}")
-            
-            progress_bar.progress((i + 1) / len(videos))
-        
-        progress_bar.empty()
-        status.write(f"Processed {success_count} videos with captions")
-        status.write(f"Created {len(all_documents)} searchable chunks")
-        
-        # DEBUG: Show first 3 errors
-        if errors:
-            status.write("First few errors:")
-            for err in errors[:3]:
-                status.write(f"   {err}")
-        
-        if not all_documents:
-            status.update(label="Error", state="error")
-            st.error("No transcripts found.")
-            st.stop()
-        
-        status.write("Searching for relevant segments...")
-        results = semantic_search(all_documents, what, api_key, top_k=5)
-        avg_score = sum(score for _, score in results) / len(results)
-        status.write(f"Relevance: {avg_score:.1f}%")
-        
-        status.update(label="Done!", state="complete", expanded=False)
-        
-        st.markdown("---")
-        st.markdown("### Their Answer")
-        st.markdown(f"**Relevance Score:** {avg_score:.1f}%")
-        st.markdown(f"*Searched {success_count} videos, {len(all_documents)} chunks*")
-        
-        for i, (doc, score) in enumerate(results, 1):
-            start_sec = int(doc.metadata['start'])
-            video_url = doc.metadata['url']
-            video_title = doc.metadata['video_title']
-            
-            st.markdown(f"---")
-            st.markdown(f"**Clip {i}** from: *{video_title}*")
-            st.markdown(f"Relevance: {score:.1f}% | Starts at {start_sec}s")
-            st.video(video_url, start_time=start_sec)
-            
-            with st.expander(f"View transcript"):
-                st.write(doc.page_content)
+        for video in scrapetube.get_channel(channel_username=channel_handle, limit=limit):
+            videos.append({
+                "id": video["videoId"],
+                "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
+            })
+    except:
+        try:
+            for video in scrapetube.get_channel(channel_url=f"https://www.youtube.com/@{channel_handle}", limit=limit):
+                videos.append({
+                    "id": video["videoId"],
+                    "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
+                })
+        except Exception as e:
+            st.error(f"Could not fetch channel: {e}")
+    return videos
+
+
+def get_transcript_with_timestamps(video_id):
+    from youtube_transcript_api import YouTubeTranscriptApi
     
-    except Exception as e:
-        status.update(label="Error", state="error")
-        st.error(f"Error: {str(e)}")
+    ytt_api = YouTubeTranscriptApi()
+    transcript = ytt_api.fetch(video_id)
+    
+    processed = []
+    for item in transcript:
+        processed.append({
+            "text": item.text,
+            "start": item.start,
+            "end": item.start + item.duration
+        })
+    return processed
 
 
 def create_documents_with_timestamps(transcript_segments, video_id, video_title, chunk_size=500):
