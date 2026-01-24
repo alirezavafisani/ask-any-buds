@@ -1,9 +1,7 @@
 import streamlit as st
-import time
-import json
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 import scrapetube
 
@@ -12,7 +10,7 @@ import scrapetube
 # ============================================
 st.set_page_config(
     page_title="AskAnyBuds",
-    page_icon="🎙️",
+    page_icon="A",
     layout="centered"
 )
 
@@ -46,21 +44,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown("# AskAnyBuds")
-st.markdown("<p style='text-align:center;color:#666;'>Agentic RAG | Ask any YouTuber anything</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#666;'>Ask any YouTuber anything. Search their entire channel.</p>", unsafe_allow_html=True)
 st.markdown("---")
 
 # ============================================
-# API KEY & LLM
+# API KEY
 # ============================================
 api_key = st.secrets.get("OPENAI_API_KEY")
 if not api_key:
-    st.error("OpenAI API Key missing.")
+    st.error("OpenAI API Key missing. Add it to Streamlit Secrets.")
     st.stop()
 
-llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.3, openai_api_key=api_key)
-
 # ============================================
-# CORE FUNCTIONS (ORIGINAL WORKING VERSIONS)
+# HELPER FUNCTIONS
 # ============================================
 
 def extract_channel_id(url):
@@ -77,34 +73,23 @@ def get_channel_videos(channel_handle, limit=50):
     videos = []
     try:
         for video in scrapetube.get_channel(channel_username=channel_handle, limit=limit):
-            title = "Unknown"
-            try:
-                title = video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
-            except:
-                pass
             videos.append({
                 "id": video["videoId"],
-                "title": title
+                "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
             })
     except:
         try:
             for video in scrapetube.get_channel(channel_url=f"https://www.youtube.com/@{channel_handle}", limit=limit):
-                title = "Unknown"
-                try:
-                    title = video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
-                except:
-                    pass
                 videos.append({
                     "id": video["videoId"],
-                    "title": title
+                    "title": video.get("title", {}).get("runs", [{}])[0].get("text", "Unknown")
                 })
-        except:
-            pass
+        except Exception as e:
+            st.error(f"Could not fetch channel: {e}")
     return videos
 
 
 def get_transcript_with_timestamps(video_id):
-    """ORIGINAL WORKING VERSION - DO NOT CHANGE"""
     try:
         ytt_api = YouTubeTranscriptApi()
         transcript_list = ytt_api.fetch(video_id)
@@ -165,249 +150,106 @@ def create_documents_with_timestamps(transcript_segments, video_id, video_title,
     return documents
 
 
-# ============================================
-# AGENT FUNCTIONS
-# ============================================
-
-def rewrite_query(original_query, feedback=None):
-    """Agent: Query Rewriter"""
-    feedback_text = f"\nPrevious search failed. Feedback: {feedback}" if feedback else ""
-    
-    prompt = f"""Generate 3 different search queries to find video clips answering this question:
-"{original_query}"
-{feedback_text}
-
-Return ONLY a JSON array of 3 strings. Example: ["query one", "query two", "query three"]"""
-
-    response = llm.invoke(prompt)
-    try:
-        content = response.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].replace("json", "").strip()
-        return json.loads(content)[:3]
-    except:
-        return [original_query]
-
-
-def rank_videos_by_relevance(videos, question):
-    """Agent: Video Ranker"""
-    video_list = "\n".join([f"{i}. {v['title']}" for i, v in enumerate(videos)])
-    
-    prompt = f"""Question: "{question}"
-
-Videos:
-{video_list}
-
-Return JSON array of video numbers ordered by relevance (most relevant first).
-Example: [5, 2, 8, 0, 1]"""
-
-    response = llm.invoke(prompt)
-    try:
-        content = response.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].replace("json", "").strip()
-        rankings = json.loads(content)
-        return [int(r) for r in rankings if int(r) < len(videos)]
-    except:
-        return list(range(len(videos)))
-
-
-def evaluate_chunks(question, chunks):
-    """Agent: Evaluator"""
-    chunks_text = "\n\n".join([f"Chunk {i+1}: {doc.page_content[:400]}" for i, (doc, _) in enumerate(chunks[:5])])
-    
-    prompt = f"""Question: "{question}"
-
-Retrieved chunks:
-{chunks_text}
-
-Return JSON: {{"is_good": true/false, "score": 0-100, "feedback": "what to search for if not good"}}"""
-
-    response = llm.invoke(prompt)
-    try:
-        content = response.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].replace("json", "").strip()
-        return json.loads(content)
-    except:
-        return {"is_good": True, "score": 70, "feedback": ""}
-
-
-def rerank_chunks(question, chunks):
-    """Agent: Re-ranker"""
-    chunks_text = "\n\n".join([f"[{i}] {doc.page_content[:300]}" for i, (doc, _) in enumerate(chunks)])
-    
-    prompt = f"""Question: "{question}"
-
-Chunks:
-{chunks_text}
-
-Score each chunk 0-100 for relevance. Return JSON: {{"0": 85, "1": 45, "2": 72}}"""
-
-    response = llm.invoke(prompt)
-    try:
-        content = response.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].replace("json", "").strip()
-        scores = json.loads(content)
-        reranked = [(doc, float(scores.get(str(i), score))) for i, (doc, score) in enumerate(chunks)]
-        reranked.sort(key=lambda x: x[1], reverse=True)
-        return reranked
-    except:
-        return chunks
-
-
-def semantic_search_multi_query(documents, queries, api_key, top_k=10):
-    """Search with multiple queries"""
+def semantic_search(documents, query, api_key, top_k=5):
     embeddings = OpenAIEmbeddings(openai_api_key=api_key)
     vector_store = FAISS.from_documents(documents, embeddings)
+    results = vector_store.similarity_search_with_score(query, k=top_k)
     
-    all_results = {}
-    for query in queries:
-        results = vector_store.similarity_search_with_score(query, k=top_k)
-        for doc, distance in results:
-            doc_id = f"{doc.metadata['video_id']}_{doc.metadata['start']}"
-            similarity = max(0, min(100, (1 - distance / 2) * 100))
-            if doc_id not in all_results or similarity > all_results[doc_id][1]:
-                all_results[doc_id] = (doc, similarity)
+    processed_results = []
+    for doc, distance in results:
+        similarity = max(0, min(100, (1 - distance / 2) * 100))
+        processed_results.append((doc, similarity))
     
-    combined = list(all_results.values())
-    combined.sort(key=lambda x: x[1], reverse=True)
-    return combined[:top_k]
+    return processed_results
 
 
 # ============================================
 # MAIN UI
 # ============================================
 
-who = st.text_input("Who to ask?", placeholder="YouTube channel URL")
+who = st.text_input("Who to ask?", placeholder="YouTube channel URL (e.g. https://www.youtube.com/@IAmMarkManson)")
 what = st.text_input("What to ask?", placeholder="Your question")
-video_limit = st.slider("Videos to fetch", 20, 150, 50)
-top_n = st.slider("Top N relevant videos to search", 5, 30, 12)
+video_limit = st.slider("How many videos to search?", min_value=10, max_value=100, value=30)
 
-if st.button("🎙️ Search Channel"):
+if st.button("Search Channel"):
     if not who or not what:
         st.warning("Please fill in both fields.")
         st.stop()
     
     channel_handle = extract_channel_id(who)
-    status = st.status("🤖 Agentic RAG Pipeline...", expanded=True)
+    if not channel_handle:
+        st.error("Invalid channel URL.")
+        st.stop()
+    
+    status = st.status("Processing channel...", expanded=True)
     
     try:
-        # Step 1: Get videos
-        status.write(f"📺 Fetching videos from @{channel_handle}...")
+        status.write(f"Fetching videos from @{channel_handle}...")
         videos = get_channel_videos(channel_handle, limit=video_limit)
         
         if not videos:
-            st.error("Could not find videos.")
+            status.update(label="Error", state="error")
+            st.error("Could not find any videos. Check the channel URL.")
             st.stop()
         
-        status.write(f"   Found {len(videos)} videos")
+        status.write(f"Found {len(videos)} videos")
         
-        # Step 2: Rank videos
-        status.write("🧠 Agent 1: Ranking videos by relevance...")
-        rankings = rank_videos_by_relevance(videos, what)
-        top_videos = [videos[i] for i in rankings[:top_n] if i < len(videos)]
-        
-        if not top_videos:
-            top_videos = videos[:top_n]
-        
-        status.write(f"   Selected top {len(top_videos)} videos")
-        
-        # Step 3: Fetch transcripts
-        status.write("📝 Fetching transcripts...")
+        status.write("Fetching transcripts (this may take a minute)...")
         all_documents = []
         success_count = 0
         
-        progress = st.progress(0)
-        for i, video in enumerate(top_videos):
+        progress_bar = st.progress(0)
+        
+        for i, video in enumerate(videos):
             transcript = get_transcript_with_timestamps(video["id"])
             if transcript:
-                docs = create_documents_with_timestamps(transcript, video["id"], video["title"])
+                docs = create_documents_with_timestamps(
+                    transcript, 
+                    video["id"], 
+                    video["title"]
+                )
                 all_documents.extend(docs)
                 success_count += 1
-                status.write(f"   ✓ {video['title'][:50]}")
-            progress.progress((i + 1) / len(top_videos))
-            time.sleep(0.3)
+            
+            progress_bar.progress((i + 1) / len(videos))
         
-        progress.empty()
-        
-        # Fallback if no transcripts
-        if not all_documents:
-            status.write("⚠️ Trying remaining videos...")
-            remaining = [v for v in videos if v not in top_videos]
-            for video in remaining[:20]:
-                transcript = get_transcript_with_timestamps(video["id"])
-                if transcript:
-                    docs = create_documents_with_timestamps(transcript, video["id"], video["title"])
-                    all_documents.extend(docs)
-                    success_count += 1
-                    status.write(f"   ✓ {video['title'][:50]}")
-                    if success_count >= 8:
-                        break
-                time.sleep(0.3)
-        
-        status.write(f"   Total: {success_count} videos, {len(all_documents)} chunks")
+        progress_bar.empty()
+        status.write(f"Processed {success_count} videos with captions")
+        status.write(f"Created {len(all_documents)} searchable chunks")
         
         if not all_documents:
-            st.error("No transcripts found. Try a different channel.")
+            status.update(label="Error", state="error")
+            st.error("No transcripts found. The channel may not have captions enabled.")
             st.stop()
         
-        # Step 4: Agentic search loop
-        best_results = None
-        best_score = 0
-        feedback = None
+        status.write("Searching for relevant segments...")
+        results = semantic_search(all_documents, what, api_key, top_k=5)
+        avg_score = sum(score for _, score in results) / len(results)
+        status.write(f"Relevance: {avg_score:.1f}%")
         
-        for attempt in range(3):
-            status.write(f"🔄 Search attempt {attempt + 1}/3")
-            
-            # Rewrite query
-            status.write("   🧠 Agent 2: Rewriting query...")
-            queries = rewrite_query(what, feedback)
-            status.write(f"   Queries: {queries}")
-            
-            # Search
-            results = semantic_search_multi_query(all_documents, queries, api_key, top_k=8)
-            
-            # Evaluate
-            status.write("   🧠 Agent 3: Evaluating results...")
-            evaluation = evaluate_chunks(what, results)
-            status.write(f"   Score: {evaluation['score']}%, Good: {evaluation['is_good']}")
-            
-            if evaluation["score"] > best_score:
-                best_score = evaluation["score"]
-                best_results = results
-            
-            if evaluation["is_good"] or attempt == 2:
-                break
-            
-            feedback = evaluation["feedback"]
+        status.update(label="Done!", state="complete", expanded=False)
         
-        # Step 5: Re-rank
-        status.write("🧠 Agent 4: Re-ranking results...")
-        final_results = rerank_chunks(what, best_results[:6])
-        final_score = sum(s for _, s in final_results) / len(final_results)
-        
-        status.update(label="✅ Complete!", state="complete", expanded=False)
-        
-        # Display
         st.markdown("---")
-        st.markdown("### 🎧 Their Answer")
-        st.markdown(f"**Relevance Score:** {final_score:.1f}%")
-        st.markdown(f"*{success_count} videos, {len(all_documents)} chunks, {attempt + 1} iterations*")
+        st.markdown("### Their Answer")
+        st.markdown(f"**Relevance Score:** {avg_score:.1f}%")
+        st.markdown(f"*Searched {success_count} videos, {len(all_documents)} chunks*")
         
-        for i, (doc, score) in enumerate(final_results[:5], 1):
+        for i, (doc, score) in enumerate(results, 1):
             start_sec = int(doc.metadata['start'])
-            st.markdown("---")
-            st.markdown(f"**Clip {i}** from: *{doc.metadata['video_title']}*")
+            video_url = doc.metadata['url']
+            video_title = doc.metadata['video_title']
+            
+            st.markdown(f"---")
+            st.markdown(f"**Clip {i}** from: *{video_title}*")
             st.markdown(f"Relevance: {score:.1f}% | Starts at {start_sec}s")
-            st.video(doc.metadata['url'], start_time=start_sec)
-            with st.expander("View transcript"):
+            st.video(video_url, start_time=start_sec)
+            
+            with st.expander(f"View transcript"):
                 st.write(doc.page_content)
     
     except Exception as e:
-        status.update(label="❌ Error", state="error")
+        status.update(label="Error", state="error")
         st.error(f"Error: {str(e)}")
 
 st.markdown("---")
-st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>Agentic RAG Pipeline</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>RAG + Semantic Search Across Entire Channels</p>", unsafe_allow_html=True)
