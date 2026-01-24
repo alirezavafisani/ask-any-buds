@@ -5,7 +5,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.documents import Document
 import scrapetube
 import json
-
+import time
 # ============================================
 # PAGE CONFIG
 # ============================================
@@ -261,7 +261,7 @@ def get_channel_videos(channel_handle, limit=50):
 def get_transcript_with_timestamps(video_id, status=None):
     try:
         ytt_api = YouTubeTranscriptApi()
-        transcript_list = ytt_api.fetch(video_id)
+        transcript_list = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
         processed = []
         for item in transcript_list:
             processed.append({
@@ -271,9 +271,22 @@ def get_transcript_with_timestamps(video_id, status=None):
             })
         return processed
     except Exception as e:
-        if status:
-            status.write(f"   ✗ {video_id}: {str(e)[:80]}")
-        return None
+        try:
+            # Fallback: try without language filter
+            ytt_api = YouTubeTranscriptApi()
+            transcript_list = ytt_api.fetch(video_id)
+            processed = []
+            for item in transcript_list:
+                processed.append({
+                    "text": item.text,
+                    "start": item.start,
+                    "end": item.start + item.duration
+                })
+            return processed
+        except Exception as e2:
+            if status:
+                status.write(f"   ✗ {video_id}: {str(e2)[:60]}")
+            return None
 
 
 def create_documents_with_timestamps(transcript_segments, video_id, video_title, chunk_size=500):
@@ -413,6 +426,7 @@ if st.button("🎙️ Search Channel"):
             else:
                 failed_videos.append(video["id"])
             progress_bar.progress((i + 1) / len(top_videos))
+            time.sleep(0.5)
         
         progress_bar.empty()
         
