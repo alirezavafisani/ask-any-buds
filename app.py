@@ -4,6 +4,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 import scrapetube
+import requests
+import re
 
 # ============================================
 # PAGE CONFIG
@@ -60,7 +62,6 @@ if not api_key:
 # ============================================
 
 def extract_channel_handle(url):
-    """Extract channel handle from URL like youtube.com/@MarkManson"""
     if "/@" in url:
         handle = url.split("/@")[1].split("/")[0].split("?")[0]
         return handle
@@ -72,7 +73,6 @@ def extract_channel_handle(url):
 
 
 def extract_video_id(url):
-    """Extract video ID from a single video URL"""
     if "v=" in url:
         return url.split("v=")[1].split("&")[0]
     elif "youtu.be/" in url:
@@ -82,17 +82,58 @@ def extract_video_id(url):
     return None
 
 
-def get_channel_videos(channel_handle, limit=10):
-    """Get list of video IDs from a channel"""
-    videos = scrapetube.get_channel(channel_username=channel_handle, limit=limit)
+def get_channel_videos(channel_handle, limit=10, status=None):
+    """Try multiple methods to get channel videos"""
     video_ids = []
-    for video in videos:
-        video_ids.append(video['videoId'])
+    
+    # Method 1: scrapetube with channel_username
+    try:
+        if status:
+            status.write("   Trying method 1 (username)...")
+        videos = scrapetube.get_channel(channel_username=channel_handle, limit=limit)
+        for video in videos:
+            video_ids.append(video['videoId'])
+        if video_ids:
+            return video_ids
+    except Exception as e:
+        if status:
+            status.write(f"   Method 1 failed: {str(e)[:40]}")
+    
+    # Method 2: scrapetube with channel_url
+    try:
+        if status:
+            status.write("   Trying method 2 (URL)...")
+        channel_url = f"https://www.youtube.com/@{channel_handle}"
+        videos = scrapetube.get_channel(channel_url=channel_url, limit=limit)
+        for video in videos:
+            video_ids.append(video['videoId'])
+        if video_ids:
+            return video_ids
+    except Exception as e:
+        if status:
+            status.write(f"   Method 2 failed: {str(e)[:40]}")
+    
+    # Method 3: Direct scrape from channel page
+    try:
+        if status:
+            status.write("   Trying method 3 (direct scrape)...")
+        channel_url = f"https://www.youtube.com/@{channel_handle}/videos"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(channel_url, headers=headers)
+        video_ids = re.findall(r'watch\?v=([a-zA-Z0-9_-]{11})', response.text)
+        video_ids = list(dict.fromkeys(video_ids))[:limit]
+        if video_ids:
+            return video_ids
+    except Exception as e:
+        if status:
+            status.write(f"   Method 3 failed: {str(e)[:40]}")
+    
     return video_ids
 
 
 def get_transcript_with_timestamps(video_id, status=None):
-    """Fetch transcript for a single video"""
     try:
         ytt_api = YouTubeTranscriptApi()
         transcript_list = ytt_api.fetch(video_id)
@@ -107,12 +148,11 @@ def get_transcript_with_timestamps(video_id, status=None):
         return processed
     except Exception as e:
         if status:
-            status.write(f"      ⚠️ Skipped: {str(e)[:60]}")
+            status.write(f"      ⚠️ Skipped: {str(e)[:50]}")
         return []
 
 
 def create_documents_with_timestamps(transcript_segments, chunk_size=500):
-    """Create documents preserving timestamps and video source"""
     documents = []
     current_text = ""
     current_start = None
@@ -159,7 +199,6 @@ def create_documents_with_timestamps(transcript_segments, chunk_size=500):
 
 
 def semantic_search(documents, query, api_key, top_k=3):
-    """Search for relevant chunks"""
     embeddings = OpenAIEmbeddings(openai_api_key=api_key)
     vector_store = FAISS.from_documents(documents, embeddings)
     results = vector_store.similarity_search_with_score(query, k=top_k)
@@ -199,8 +238,12 @@ if st.button("🎙️ Generate Answer"):
         
         if channel_handle:
             status.write(f"📺 Fetching videos from @{channel_handle}...")
-            video_ids = get_channel_videos(channel_handle, limit=num_videos)
+            video_ids = get_channel_videos(channel_handle, limit=num_videos, status=status)
             status.write(f"   Found {len(video_ids)} videos")
+            
+            if not video_ids:
+                st.error("Could not fetch videos from this channel. Try pasting individual video URLs instead.")
+                st.stop()
             
             for i, vid in enumerate(video_ids, 1):
                 status.write(f"📝 Getting transcript {i}/{len(video_ids)} ({vid})...")
