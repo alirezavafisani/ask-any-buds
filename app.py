@@ -108,24 +108,27 @@ def rank_videos_by_relevance(videos, question):
     video_list = ""
     for i, v in enumerate(videos):
         title = v.get("title", "Unknown")
-        desc = v.get("description", "")[:200]
-        video_list += f"{i}. Title: {title}\n   Description: {desc}\n\n"
+        video_list += f"{i}. {title}\n"
     
-    prompt = f"""You are a relevance ranker. Given a user's question and a list of video titles/descriptions, rank which videos are MOST likely to contain an answer.
+    prompt = f"""Given this question: "{question}"
 
-User's Question: "{question}"
-
-Videos:
+And these video titles:
 {video_list}
 
-Return ONLY a JSON array of video indices (numbers) ordered from most relevant to least relevant.
-Example: [3, 7, 1, 0, 5, 2, 4, 6]
-
-Return ALL indices, most relevant first."""
+Return a JSON array of the video numbers (integers) ordered from MOST relevant to LEAST relevant.
+Only return the JSON array, nothing else. Example: [5, 2, 8, 0, 1, 3, 4, 6, 7]"""
 
     response = llm.invoke(prompt)
     try:
-        rankings = json.loads(response.content)
+        content = response.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        rankings = json.loads(content)
+        rankings = [int(r) for r in rankings if int(r) < len(videos)]
+        if not rankings:
+            rankings = list(range(len(videos)))
         return rankings
     except:
         return list(range(len(videos)))
@@ -374,7 +377,16 @@ if st.button("🎙️ Search Channel"):
         status.write("🧠 Agent 1: Ranking videos by relevance to your question...")
         rankings = rank_videos_by_relevance(videos, what)
         
-        top_videos = [videos[i] for i in rankings[:top_n_videos] if i < len(videos)]
+        top_videos = []
+        for i in rankings[:top_n_videos]:
+            try:
+                if isinstance(i, int) and 0 <= i < len(videos):
+                    top_videos.append(videos[i])
+            except:
+                continue
+
+        if not top_videos:
+            top_videos = videos[:top_n_videos]
         status.write(f"   Selected top {len(top_videos)} most relevant videos")
         
         # Step 3: Fetch transcripts for top videos only
