@@ -74,15 +74,17 @@ def extract_video_id(url):
 
 
 def get_transcript_with_timestamps(video_id):
-    transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+    ytt_api = YouTubeTranscriptApi()
+    transcript_list = ytt_api.fetch(video_id)
     processed = []
     for item in transcript_list:
         processed.append({
-            "text": item["text"],
-            "start": item["start"],
-            "end": item["start"] + item["duration"]
+            "text": item.text,
+            "start": item.start,
+            "end": item.start + item.duration
         })
     return processed
+
 
 
 def create_documents_with_timestamps(transcript_segments, chunk_size=500):
