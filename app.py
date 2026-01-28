@@ -1,13 +1,19 @@
 import streamlit as st
 import time
 import json
+import requests
+import random
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 from openai import OpenAI
-import scrapetube
+
+# YouTube Data API endpoints
+YT_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YT_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
+YT_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 
 # ============================================
 # PAGE CONFIG
@@ -52,11 +58,17 @@ st.markdown("<p style='text-align:center;color:#666;'>Hear answers in their own 
 st.markdown("---")
 
 # ============================================
-# API KEY
+# API KEYS
 # ============================================
-api_key = st.secrets.get("OPENAI_API_KEY")
-if not api_key:
+openai_api_key = st.secrets.get("OPENAI_API_KEY")
+youtube_api_key = st.secrets.get("YOUTUBE_API_KEY")
+
+if not openai_api_key:
     st.error("OpenAI API Key missing. Add it to Streamlit Secrets.")
+    st.stop()
+
+if not youtube_api_key:
+    st.error("YouTube API Key missing. Add YOUTUBE_API_KEY to Streamlit Secrets.")
     st.stop()
 
 # ============================================
@@ -86,34 +98,89 @@ def extract_video_id(url):
     return None
 
 
-def get_channel_videos_with_titles(channel_handle, limit=100):
-    """Get video IDs and titles from a channel"""
-    videos = scrapetube.get_channel(channel_username=channel_handle, limit=limit)
+def get_channel_id_from_handle(handle, youtube_api_key):
+    """Convert @handle to channel ID using YouTube Data API"""
+    # Try as custom URL first
+    params = {
+        "key": youtube_api_key,
+        "part": "id",
+        "forHandle": handle
+    }
+    r = requests.get(YT_CHANNELS_URL, params=params, timeout=20)
+    
+    if r.status_code == 200:
+        data = r.json()
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"]
+    
+    # Fallback: search for the channel
+    params = {
+        "key": youtube_api_key,
+        "part": "snippet",
+        "q": handle,
+        "type": "channel",
+        "maxResults": 1
+    }
+    r = requests.get(YT_SEARCH_URL, params=params, timeout=20)
+    if r.status_code == 200:
+        data = r.json()
+        items = data.get("items", [])
+        if items:
+            return items[0]["snippet"]["channelId"]
+    
+    return None
+
+
+def get_channel_videos_with_titles(channel_handle, youtube_api_key, limit=50):
+    """Get video IDs and titles from a channel using YouTube Data API"""
+    
+    # First get the channel ID
+    channel_id = get_channel_id_from_handle(channel_handle, youtube_api_key)
+    if not channel_id:
+        return []
+    
     video_list = []
-    for video in videos:
-        video_id = video.get('videoId')
+    next_page_token = None
+    
+    while len(video_list) < limit:
+        # Search for videos from this channel
+        params = {
+            "key": youtube_api_key,
+            "part": "snippet",
+            "channelId": channel_id,
+            "type": "video",
+            "order": "date",  # Most recent first
+            "maxResults": min(50, limit - len(video_list)),
+        }
+        if next_page_token:
+            params["pageToken"] = next_page_token
         
-        # Extract title from scrapetube's nested structure
-        title_data = video.get('title', {})
-        if isinstance(title_data, dict):
-            runs = title_data.get('runs', [])
-            if runs:
-                title = runs[0].get('text', 'Untitled')
-            else:
-                title = title_data.get('simpleText', 'Untitled')
-        else:
-            title = str(title_data) if title_data else 'Untitled'
+        r = requests.get(YT_SEARCH_URL, params=params, timeout=20)
+        if r.status_code != 200:
+            break
         
-        video_list.append({
-            'video_id': video_id,
-            'title': title
-        })
-    return video_list
+        data = r.json()
+        
+        for item in data.get("items", []):
+            video_id = item.get("id", {}).get("videoId")
+            title = item.get("snippet", {}).get("title", "Untitled")
+            if video_id:
+                video_list.append({
+                    "video_id": video_id,
+                    "title": title
+                })
+        
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
+            break
+    
+    return video_list[:limit]
 
 
-def select_relevant_videos(videos, question, openai_api_key, max_videos=20):
+def select_relevant_videos(videos, question, openai_key, max_videos=20):
     """Use GPT 4o mini to select most relevant videos based on the question"""
-    client = OpenAI(api_key=openai_api_key)
+    client = OpenAI(api_key=openai_key)
     
     # Create a numbered list of videos for the prompt
     video_list_text = "\n".join([f"{i+1}. {v['title']}" for i, v in enumerate(videos)])
@@ -163,7 +230,7 @@ Return ONLY the JSON array, nothing else."""
         return videos[:max_videos]
 
 
-def fetch_transcript_with_timestamps(video_id, max_retries=3):
+def fetch_transcript_with_timestamps(video_id, max_retries=2):
     """
     Fetch transcript using the robust list then fetch approach.
     Prefers manual captions but falls back to auto generated.
@@ -242,13 +309,22 @@ def fetch_transcript_with_timestamps(video_id, max_retries=3):
         except VideoUnavailable:
             return {"ok": False, "error": "VideoUnavailable", "segments": []}
         except Exception as e:
-            # Transient error, retry with backoff
+            error_str = str(e)
+            # Check if it's an IP block
+            if "RequestBlocked" in error_str or "blocked" in error_str.lower():
+                # For IP blocks, retry with longer delay
+                if attempt < max_retries - 1:
+                    time.sleep(10 + random.uniform(0, 5))  # 10 to 15 seconds
+                    continue
+                return {"ok": False, "error": "IP_BLOCKED", "segments": []}
+            
+            # Other transient errors
             if attempt < max_retries - 1:
-                time.sleep(1.0 * (attempt + 1))
+                time.sleep(3 + random.uniform(0, 2))
                 continue
             return {
                 "ok": False,
-                "error": f"Exception: {type(e).__name__}: {str(e)}",
+                "error": f"Exception: {type(e).__name__}: {str(e)[:100]}",
                 "segments": []
             }
     
@@ -345,18 +421,18 @@ if st.button("Generate Answer"):
         all_transcripts = []
         
         if channel_handle:
-            # STEP 1: Fetch all video titles from channel
+            # STEP 1: Fetch all video titles from channel using YouTube Data API
             status.write(f"📺 Fetching video list from @{channel_handle}...")
-            all_videos = get_channel_videos_with_titles(channel_handle, limit=100)
+            all_videos = get_channel_videos_with_titles(channel_handle, youtube_api_key, limit=50)
             status.write(f"   Found {len(all_videos)} videos in channel")
             
             if not all_videos:
-                st.error("Could not find any videos in this channel.")
+                st.error("Could not find any videos in this channel. Check the URL or try again.")
                 st.stop()
             
             # STEP 2: Use AI to select most relevant videos
             status.write("🧠 Analyzing titles to find relevant videos...")
-            selected_videos = select_relevant_videos(all_videos, what, api_key, max_videos=20)
+            selected_videos = select_relevant_videos(all_videos, what, openai_api_key, max_videos=15)
             status.write(f"   Selected {len(selected_videos)} relevant videos")
             
             # Show which videos were selected
@@ -364,40 +440,55 @@ if st.button("Generate Answer"):
                 for i, v in enumerate(selected_videos, 1):
                     st.write(f"{i}. {v['title']}")
             
-            # STEP 3: Fetch transcripts for selected videos
-            status.write("📝 Fetching transcripts...")
+            # STEP 3: Fetch transcripts for selected videos with long delays
+            status.write("📝 Fetching transcripts (this takes a while to avoid rate limits)...")
             successful = 0
             failed = 0
             failed_details = []
+            ip_blocked = False
             
             for i, video in enumerate(selected_videos, 1):
                 vid = video['video_id']
                 title_short = video['title'][:40] + "..." if len(video['title']) > 40 else video['title']
-                status.write(f"   [{i}/{len(selected_videos)}] {title_short} (ID: {vid})")
+                status.write(f"   [{i}/{len(selected_videos)}] {title_short}")
                 
                 result = fetch_transcript_with_timestamps(vid)
                 
                 if result["ok"]:
                     all_transcripts.extend(result["segments"])
                     successful += 1
-                    status.write(f"      ✓ Got {len(result['segments'])} segments ({result.get('language', 'unknown')})")
+                    status.write(f"      ✓ Got {len(result['segments'])} segments")
                 else:
                     failed += 1
                     error_msg = result.get("error", "Unknown")
                     failed_details.append(f"{title_short}: {error_msg}")
                     status.write(f"      ✗ Failed: {error_msg}")
+                    
+                    # If IP is blocked, stop trying more videos
+                    if error_msg == "IP_BLOCKED":
+                        ip_blocked = True
+                        status.write("   ⚠️ YouTube is blocking requests. Stopping to avoid further blocks.")
+                        break
                 
-                # Small delay between requests to be nice to YouTube
-                if i < len(selected_videos):
-                    time.sleep(0.5)
+                # Long delay between requests (5 to 8 seconds)
+                if i < len(selected_videos) and not ip_blocked:
+                    delay = 5 + random.uniform(0, 3)
+                    status.write(f"      ⏳ Waiting {delay:.1f}s...")
+                    time.sleep(delay)
             
             status.write(f"   ✓ Got transcripts from {successful} videos ({failed} unavailable)")
             
             # Show failed videos details
             if failed_details:
-                with st.expander(f"Failed Videos ({len(failed_details)})", expanded=True):
+                with st.expander(f"Failed Videos ({len(failed_details)})", expanded=False):
                     for detail in failed_details:
                         st.write(detail)
+            
+            # If IP was blocked and we got nothing, show helpful message
+            if ip_blocked and successful == 0:
+                st.error("YouTube is blocking transcript requests from this server's IP address.")
+                st.info("**Workarounds:**\n\n1. Try again later (YouTube may unblock after some time)\n\n2. Run the app locally on your computer\n\n3. Use a proxy service")
+                st.stop()
             status.write(f"   Total segments: {len(all_transcripts)}")
         
         else:
@@ -423,7 +514,7 @@ if st.button("Generate Answer"):
         
         # STEP 5: Semantic search
         status.write("🔍 Searching for relevant segments...")
-        results = semantic_search(documents, what, api_key, top_k=3)
+        results = semantic_search(documents, what, openai_api_key, top_k=3)
         avg_score = sum(score for _, score in results) / len(results) if results else 0
         status.write(f"   Relevance: {avg_score:.1f}%")
         
