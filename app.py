@@ -175,11 +175,16 @@ def fetch_transcript_with_timestamps(video_id, max_retries=3):
             # First list available transcripts
             tlist = ytt.list(video_id)
             
+            # Convert to list to check if empty
+            transcript_options = list(tlist)
+            if not transcript_options:
+                return {"ok": False, "error": "No transcript tracks available", "segments": []}
+            
             # Prefer manual English captions, then any manual, then generated
             chosen = None
             
             # Priority 1: Manual English
-            for t in tlist:
+            for t in transcript_options:
                 code = (t.language_code or "").lower()
                 if not t.is_generated and (code == "en" or code.startswith("en-")):
                     chosen = t
@@ -187,14 +192,14 @@ def fetch_transcript_with_timestamps(video_id, max_retries=3):
             
             # Priority 2: Any manual caption
             if chosen is None:
-                for t in tlist:
+                for t in transcript_options:
                     if not t.is_generated:
                         chosen = t
                         break
             
             # Priority 3: Generated English
             if chosen is None:
-                for t in tlist:
+                for t in transcript_options:
                     code = (t.language_code or "").lower()
                     if code == "en" or code.startswith("en-"):
                         chosen = t
@@ -202,7 +207,7 @@ def fetch_transcript_with_timestamps(video_id, max_retries=3):
             
             # Priority 4: Any available
             if chosen is None:
-                chosen = next(iter(tlist), None)
+                chosen = transcript_options[0]
             
             if chosen is None:
                 return {"ok": False, "error": "No transcripts found", "segments": []}
@@ -230,13 +235,12 @@ def fetch_transcript_with_timestamps(video_id, max_retries=3):
                 "is_generated": chosen.is_generated
             }
             
-        except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-            # These are permanent failures, no point retrying
-            return {
-                "ok": False,
-                "error": type(e).__name__,
-                "segments": []
-            }
+        except TranscriptsDisabled:
+            return {"ok": False, "error": "TranscriptsDisabled", "segments": []}
+        except NoTranscriptFound:
+            return {"ok": False, "error": "NoTranscriptFound", "segments": []}
+        except VideoUnavailable:
+            return {"ok": False, "error": "VideoUnavailable", "segments": []}
         except Exception as e:
             # Transient error, retry with backoff
             if attempt < max_retries - 1:
@@ -244,7 +248,7 @@ def fetch_transcript_with_timestamps(video_id, max_retries=3):
                 continue
             return {
                 "ok": False,
-                "error": str(e),
+                "error": f"Exception: {type(e).__name__}: {str(e)}",
                 "segments": []
             }
     
@@ -364,25 +368,36 @@ if st.button("Generate Answer"):
             status.write("📝 Fetching transcripts...")
             successful = 0
             failed = 0
+            failed_details = []
             
             for i, video in enumerate(selected_videos, 1):
                 vid = video['video_id']
                 title_short = video['title'][:40] + "..." if len(video['title']) > 40 else video['title']
-                status.write(f"   [{i}/{len(selected_videos)}] {title_short}")
+                status.write(f"   [{i}/{len(selected_videos)}] {title_short} (ID: {vid})")
                 
                 result = fetch_transcript_with_timestamps(vid)
                 
                 if result["ok"]:
                     all_transcripts.extend(result["segments"])
                     successful += 1
+                    status.write(f"      ✓ Got {len(result['segments'])} segments ({result.get('language', 'unknown')})")
                 else:
                     failed += 1
+                    error_msg = result.get("error", "Unknown")
+                    failed_details.append(f"{title_short}: {error_msg}")
+                    status.write(f"      ✗ Failed: {error_msg}")
                 
                 # Small delay between requests to be nice to YouTube
                 if i < len(selected_videos):
                     time.sleep(0.5)
             
             status.write(f"   ✓ Got transcripts from {successful} videos ({failed} unavailable)")
+            
+            # Show failed videos details
+            if failed_details:
+                with st.expander(f"Failed Videos ({len(failed_details)})", expanded=True):
+                    for detail in failed_details:
+                        st.write(detail)
             status.write(f"   Total segments: {len(all_transcripts)}")
         
         else:
@@ -438,3 +453,23 @@ if st.button("Generate Answer"):
 
 st.markdown("---")
 st.markdown("<p style='text-align:center;color:#444;font-size:12px;'>Smart Video Selection + RAG + Semantic Search</p>", unsafe_allow_html=True)
+
+# Diagnostic section
+with st.expander("🔧 Diagnostic Test"):
+    st.write("Test if transcript fetching works on your Streamlit instance")
+    test_video_id = st.text_input("Test Video ID", value="dQw4w9WgXcQ", help="Enter any YouTube video ID to test")
+    if st.button("Run Diagnostic"):
+        st.write(f"Testing video ID: {test_video_id}")
+        st.write(f"URL: https://youtube.com/watch?v={test_video_id}")
+        
+        result = fetch_transcript_with_timestamps(test_video_id)
+        
+        if result["ok"]:
+            st.success(f"✓ SUCCESS! Got {len(result['segments'])} segments")
+            st.write(f"Language: {result.get('language', 'unknown')}")
+            st.write(f"Auto generated: {result.get('is_generated', 'unknown')}")
+            st.write("First 3 segments:")
+            for seg in result["segments"][:3]:
+                st.write(f"  [{seg['start']:.1f}s] {seg['text']}")
+        else:
+            st.error(f"✗ FAILED: {result.get('error', 'Unknown error')}")
